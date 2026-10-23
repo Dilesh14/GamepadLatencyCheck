@@ -1,10 +1,16 @@
+mod export;
 mod metrics;
+mod reaction;
 
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Sense, Stroke, Vec2};
+use export::session_csv;
 use gilrs::{EventType, GamepadId, Gilrs};
 use metrics::{IntervalSeries, IntervalSummary};
+use rand::Rng;
+use reaction::{CueShape, PressOutcome, ReactionPhase, ReactionSession};
 use std::collections::{HashMap, VecDeque};
-use std::time::{Duration, Instant};
+use std::fs;
+use std::time::{Duration, Instant, SystemTime};
 
 const BACKGROUND: Color32 = Color32::from_rgb(245, 247, 243);
 const SIDEBAR: Color32 = Color32::from_rgb(231, 237, 229);
@@ -14,6 +20,14 @@ const GREEN: Color32 = Color32::from_rgb(35, 128, 92);
 const CORAL: Color32 = Color32::from_rgb(217, 112, 86);
 const LINE: Color32 = Color32::from_rgb(211, 220, 212);
 const MAX_RECENT_EVENTS: usize = 80;
+const REACTION_DELAY_MIN_MS: u64 = 1_500;
+const REACTION_DELAY_MAX_MS: u64 = 4_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppMode {
+    Diagnostics,
+    Reaction,
+}
 
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
@@ -94,6 +108,11 @@ struct GamepadApp {
     selected_device: Option<GamepadId>,
     recent_events: VecDeque<RecentEvent>,
     session_started: Instant,
+    export_status: Option<String>,
+    mode: AppMode,
+    reaction: ReactionSession,
+    reaction_device: Option<GamepadId>,
+    reaction_notice: Option<String>,
 }
 
 impl GamepadApp {
@@ -106,6 +125,11 @@ impl GamepadApp {
             selected_device: None,
             recent_events: VecDeque::new(),
             session_started: Instant::now(),
+            export_status: None,
+            mode: AppMode::Diagnostics,
+            reaction: ReactionSession::default(),
+            reaction_device: None,
+            reaction_notice: None,
         };
         app.initialize_input();
         app
@@ -133,7 +157,7 @@ impl GamepadApp {
             };
 
             match next_event {
-                Some(event) => self.handle_event(event.id, event.event),
+                Some(event) => self.handle_event(event.id, event.event, event.time),
                 None => break,
             }
         }
@@ -141,13 +165,18 @@ impl GamepadApp {
         self.refresh_devices();
     }
 
-    fn handle_event(&mut self, id: GamepadId, event: EventType) {
+    fn handle_event(&mut self, id: GamepadId, event: EventType, event_time: SystemTime) {
         match event {
             EventType::Connected => {
                 self.refresh_devices();
                 self.push_recent_event(id, "Controller connected".to_owned(), None);
             }
             EventType::Disconnected => {
+                if self.reaction_device == Some(id) {
+                    self.reaction.pause();
+                    self.reaction_notice =
+                        Some("Controller disconnected. Session paused.".to_owned());
+                }
                 let name = self
                     .devices
                     .get(&id)
@@ -162,6 +191,7 @@ impl GamepadApp {
             }
             EventType::ButtonPressed(button, _) => {
                 self.record_input(id, true, format!("{button:?}"), 1.0, "pressed");
+                self.handle_reaction_press(id, event_time);
             }
             EventType::ButtonReleased(button, _) => {
                 self.record_input(id, true, format!("{button:?}"), 0.0, "released");
@@ -174,6 +204,57 @@ impl GamepadApp {
             }
             _ => {}
         }
+    }
+
+    fn handle_reaction_press(&mut self, id: GamepadId, event_time: SystemTime) {
+        if self.reaction_device != Some(id) {
+            return;
+        }
+
+        let (delay, shape) = random_trial_parameters();
+        let outcome = self
+            .reaction
+            .button_pressed(Instant::now(), event_time, delay, shape);
+        self.reaction_notice = match outcome {
+            PressOutcome::Ignored => self.reaction_notice.clone(),
+            PressOutcome::FalseStart => Some("False start. Wait for the next cue.".to_owned()),
+            PressOutcome::Recorded(_) => Some("Response recorded. Next trial soon.".to_owned()),
+            PressOutcome::Complete(_) => Some("Session complete. Nice work.".to_owned()),
+        };
+    }
+
+    fn start_reaction_session(&mut self) {
+        let Some(device_id) = self.selected_device else {
+            self.reaction_notice = Some("Connect and select a controller to start.".to_owned());
+            return;
+        };
+
+        let (delay, shape) = random_trial_parameters();
+        self.reaction_device = Some(device_id);
+        if self.reaction.phase() == ReactionPhase::Paused {
+            self.reaction.resume(Instant::now(), delay, shape);
+            self.reaction_notice = Some("Session resumed. Wait for the cue.".to_owned());
+        } else {
+            self.reaction.start(Instant::now(), delay, shape);
+            self.reaction_notice =
+                Some("Get ready. Press any button when the shape appears.".to_owned());
+        }
+    }
+
+    fn advance_reaction(&mut self) {
+        let now = Instant::now();
+        if self.reaction.needs_next_trial(now) {
+            let (delay, shape) = random_trial_parameters();
+            self.reaction.schedule_next_trial(now, delay, shape);
+        }
+        self.reaction.advance_cue(now, SystemTime::now());
+    }
+
+    fn set_mode(&mut self, mode: AppMode) {
+        if self.mode == AppMode::Reaction && mode != AppMode::Reaction {
+            self.reaction.pause();
+        }
+        self.mode = mode;
     }
 
     fn record_input(
@@ -279,9 +360,38 @@ impl GamepadApp {
     fn clear_session(&mut self) {
         self.recent_events.clear();
         self.session_started = Instant::now();
+        self.export_status = None;
+        self.reaction.reset();
+        self.reaction_device = None;
+        self.reaction_notice = None;
         for device in self.devices.values_mut() {
             device.reset();
         }
+    }
+
+    fn export_session(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("CSV file", &["csv"])
+            .set_file_name("gamepad-session.csv")
+            .save_file()
+        else {
+            return;
+        };
+
+        let device_name = self
+            .selected_state()
+            .map(|device| device.name.as_str())
+            .unwrap_or("No device selected");
+        let samples = self
+            .selected_state()
+            .map(|device| device.intervals.samples().collect::<Vec<_>>())
+            .unwrap_or_default();
+        let csv = session_csv(device_name, self.session_started.elapsed(), samples);
+
+        self.export_status = Some(match fs::write(&path, csv) {
+            Ok(()) => format!("Exported session to {}", path.display()),
+            Err(error) => format!("Could not export session: {error}"),
+        });
     }
 
     fn selected_state(&self) -> Option<&PadState> {
@@ -386,6 +496,27 @@ impl GamepadApp {
             .frame(egui::Frame::new().fill(BACKGROUND).inner_margin(24.0))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
+                    if ui
+                        .selectable_label(self.mode == AppMode::Diagnostics, "Diagnostics")
+                        .clicked()
+                    {
+                        self.set_mode(AppMode::Diagnostics);
+                    }
+                    if ui
+                        .selectable_label(self.mode == AppMode::Reaction, "Reaction test")
+                        .clicked()
+                    {
+                        self.set_mode(AppMode::Reaction);
+                    }
+                });
+                ui.add_space(14.0);
+
+                if self.mode == AppMode::Reaction {
+                    self.show_reaction_test(ui);
+                    return;
+                }
+
+                ui.horizontal(|ui| {
                     ui.vertical(|ui| {
                         ui.label(egui::RichText::new("GAMEPAD DIAGNOSTICS").small().strong().color(GREEN));
                         ui.add_space(4.0);
@@ -395,9 +526,16 @@ impl GamepadApp {
                         if ui.button("Reset session").clicked() {
                             self.clear_session();
                         }
+                        if ui.button("Export CSV").clicked() {
+                            self.export_session();
+                        }
                         ui.label(egui::RichText::new("APP-OBSERVED").small().strong().color(GREEN));
                     });
                 });
+
+                if let Some(status) = &self.export_status {
+                    ui.label(egui::RichText::new(status).small().color(MUTED));
+                }
 
                 ui.add_space(18.0);
                 ui.separator();
@@ -454,6 +592,11 @@ impl GamepadApp {
                         .small()
                         .color(MUTED),
                 );
+                ui.label(
+                    egui::RichText::new("CSV export includes the retained interval samples (up to 512) and session metadata.")
+                        .small()
+                        .color(MUTED),
+                );
 
                 ui.add_space(22.0);
                 ui.separator();
@@ -464,6 +607,263 @@ impl GamepadApp {
                     self.show_recent_events(&mut columns[1]);
                 });
             });
+    }
+
+    fn show_reaction_test(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
+                ui.label(
+                    egui::RichText::new("REACTION MODE")
+                        .small()
+                        .strong()
+                        .color(GREEN),
+                );
+                ui.add_space(4.0);
+                ui.heading(
+                    egui::RichText::new("Visual reaction time")
+                        .size(27.0)
+                        .color(INK),
+                );
+            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("Reset session").clicked() {
+                    self.reaction.reset();
+                    self.reaction_device = None;
+                    self.reaction_notice = None;
+                }
+                ui.label(
+                    egui::RichText::new("APP-OBSERVED")
+                        .small()
+                        .strong()
+                        .color(GREEN),
+                );
+            });
+        });
+
+        let phase = self.reaction.phase();
+        let results = self.reaction.results();
+        let summary = self.reaction.summary();
+        let active_device_name = self
+            .reaction_device
+            .and_then(|id| self.devices.get(&id).map(|device| device.name.as_str()))
+            .unwrap_or("No controller selected");
+
+        ui.add_space(14.0);
+        ui.horizontal(|ui| {
+            metric(
+                ui,
+                "TRIAL",
+                &format!(
+                    "{} / {}",
+                    results
+                        .len()
+                        .saturating_add(1)
+                        .min(self.reaction.target_trials()),
+                    self.reaction.target_trials()
+                ),
+                "successful responses",
+            );
+            metric(
+                ui,
+                "FALSE STARTS",
+                &self.reaction.false_starts().to_string(),
+                "presses before cue",
+            );
+            metric(
+                ui,
+                "SESSION MEAN",
+                &summary.map_or_else(
+                    || "--".to_owned(),
+                    |stats| format!("{:.0} ms", stats.mean_ms),
+                ),
+                "reaction time",
+            );
+            metric(
+                ui,
+                "P95 / BEST",
+                &summary.map_or_else(
+                    || "-- / --".to_owned(),
+                    |stats| format!("{:.0} / {:.0} ms", stats.p95_ms, stats.best_ms),
+                ),
+                "session results",
+            );
+        });
+
+        ui.add_space(12.0);
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new("TEST CONTROLLER")
+                    .small()
+                    .strong()
+                    .color(MUTED),
+            );
+            ui.label(egui::RichText::new(active_device_name).color(INK));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let is_running = matches!(
+                    phase,
+                    ReactionPhase::Waiting { .. }
+                        | ReactionPhase::CueVisible { .. }
+                        | ReactionPhase::ResultPause { .. }
+                );
+                if is_running && ui.button("Pause").clicked() {
+                    self.reaction.pause();
+                    self.reaction_notice = Some("Session paused.".to_owned());
+                }
+            });
+        });
+
+        ui.add_space(8.0);
+        let (cue_rect, _) =
+            ui.allocate_exact_size(Vec2::new(ui.available_width(), 250.0), Sense::hover());
+        let painter = ui.painter_at(cue_rect);
+        painter.rect_filled(
+            cue_rect,
+            egui::CornerRadius::same(8),
+            Color32::from_rgb(231, 237, 229),
+        );
+
+        match phase {
+            ReactionPhase::CueVisible { shape, .. } => match shape {
+                CueShape::Circle => {
+                    painter.circle_filled(cue_rect.center(), 48.0, GREEN);
+                }
+                CueShape::Square => {
+                    painter.rect_filled(
+                        egui::Rect::from_center_size(cue_rect.center(), Vec2::splat(92.0)),
+                        egui::CornerRadius::same(8),
+                        CORAL,
+                    );
+                }
+            },
+            ReactionPhase::Waiting { cue_at, .. } => {
+                painter.text(
+                    cue_rect.center(),
+                    Align2::CENTER_CENTER,
+                    format!(
+                        "GET READY  {:.1}s",
+                        cue_at
+                            .saturating_duration_since(Instant::now())
+                            .as_secs_f32()
+                    ),
+                    FontId::proportional(18.0),
+                    MUTED,
+                );
+            }
+            ReactionPhase::Idle => {
+                painter.text(
+                    cue_rect.center(),
+                    Align2::CENTER_CENTER,
+                    "Start when you're ready",
+                    FontId::proportional(18.0),
+                    MUTED,
+                );
+            }
+            ReactionPhase::ResultPause { .. } => {
+                painter.text(
+                    cue_rect.center(),
+                    Align2::CENTER_CENTER,
+                    "Response recorded",
+                    FontId::proportional(18.0),
+                    GREEN,
+                );
+            }
+            ReactionPhase::Paused => {
+                painter.text(
+                    cue_rect.center(),
+                    Align2::CENTER_CENTER,
+                    "Session paused",
+                    FontId::proportional(18.0),
+                    MUTED,
+                );
+            }
+            ReactionPhase::Complete => {
+                painter.text(
+                    cue_rect.center(),
+                    Align2::CENTER_CENTER,
+                    "SESSION COMPLETE",
+                    FontId::proportional(18.0),
+                    GREEN,
+                );
+            }
+        };
+
+        ui.add_space(10.0);
+        if let Some(last_result) = self.reaction.last_result() {
+            ui.label(
+                egui::RichText::new(format!(
+                    "Last reaction: {:.0} ms",
+                    last_result.as_secs_f64() * 1_000.0
+                ))
+                .strong()
+                .color(INK),
+            );
+        }
+        if let Some(notice) = &self.reaction_notice {
+            ui.label(egui::RichText::new(notice).small().color(MUTED));
+        }
+
+        ui.add_space(8.0);
+        let action_label = match phase {
+            ReactionPhase::Idle => "Start reaction test",
+            ReactionPhase::Paused => "Resume with selected controller",
+            ReactionPhase::Complete => "Run again",
+            _ => "Restart session",
+        };
+        let can_start = self.selected_device.is_some();
+        if ui
+            .add_enabled(can_start, egui::Button::new(action_label))
+            .clicked()
+        {
+            self.start_reaction_session();
+        }
+        if !can_start {
+            ui.label(
+                egui::RichText::new("Connect and select a controller in the sidebar first.")
+                    .small()
+                    .color(MUTED),
+            );
+        }
+
+        let results = self.reaction.results().to_vec();
+        if !results.is_empty() {
+            ui.add_space(8.0);
+            section_label(ui, "RECENT TRIAL RESULTS");
+            egui::ScrollArea::vertical()
+                .max_height(90.0)
+                .show(ui, |ui| {
+                    let first_visible = results.len().saturating_sub(5);
+                    for (index, result) in results.iter().enumerate().skip(first_visible).rev() {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new(format!("TRIAL {:02}", index + 1))
+                                    .small()
+                                    .strong()
+                                    .color(MUTED),
+                            );
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{:.0} ms",
+                                    result.as_secs_f64() * 1_000.0
+                                ))
+                                .monospace()
+                                .color(INK),
+                            );
+                        });
+                    }
+                });
+        }
+
+        ui.add_space(10.0);
+        ui.label(
+            egui::RichText::new("This measures app-observed visual reaction time, not controller input lag. Timing runs from cue submission to app handling of the button event.")
+                .small()
+                .color(MUTED),
+        );
+        ui.label(
+            egui::RichText::new("Human response, event queueing, frame scheduling, and display refresh affect the result; the app cannot detect when pixels physically appear.")
+                .small()
+                .color(MUTED),
+        );
     }
 
     fn show_input_state(&self, ui: &mut egui::Ui) {
@@ -621,10 +1021,22 @@ impl GamepadApp {
 impl eframe::App for GamepadApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll_events();
+        self.advance_reaction();
         self.show_sidebar(ui);
         self.show_dashboard(ui);
         ui.ctx().request_repaint_after(Duration::from_millis(8));
     }
+}
+
+fn random_trial_parameters() -> (Duration, CueShape) {
+    let mut rng = rand::rng();
+    let delay_ms = rng.random_range(REACTION_DELAY_MIN_MS..=REACTION_DELAY_MAX_MS);
+    let shape = if rng.random_bool(0.5) {
+        CueShape::Circle
+    } else {
+        CueShape::Square
+    };
+    (Duration::from_millis(delay_ms), shape)
 }
 
 fn section_label(ui: &mut egui::Ui, label: &str) {
