@@ -11,7 +11,6 @@ const SIDEBAR: Color32 = Color32::from_rgb(231, 237, 229);
 const INK: Color32 = Color32::from_rgb(31, 43, 38);
 const MUTED: Color32 = Color32::from_rgb(106, 119, 111);
 const GREEN: Color32 = Color32::from_rgb(35, 128, 92);
-const LIME: Color32 = Color32::from_rgb(180, 213, 94);
 const CORAL: Color32 = Color32::from_rgb(217, 112, 86);
 const LINE: Color32 = Color32::from_rgb(211, 220, 212);
 const MAX_RECENT_EVENTS: usize = 80;
@@ -289,12 +288,12 @@ impl GamepadApp {
         self.selected_device.and_then(|id| self.devices.get(&id))
     }
 
-    fn show_sidebar(&mut self, context: &egui::Context) {
-        egui::SidePanel::left("device_sidebar")
+    fn show_sidebar(&mut self, ui: &mut egui::Ui) {
+        egui::Panel::left("device_sidebar")
             .resizable(false)
-            .default_width(258.0)
+            .default_size(258.0)
             .frame(egui::Frame::new().fill(SIDEBAR).inner_margin(20.0))
-            .show(context, |ui| {
+            .show(ui, |ui| {
                 ui.vertical_centered(|ui| {
                     ui.add_space(6.0);
                     ui.label(egui::RichText::new("INPUT / LAB").strong().color(GREEN));
@@ -382,10 +381,10 @@ impl GamepadApp {
             });
     }
 
-    fn show_dashboard(&mut self, context: &egui::Context) {
+    fn show_dashboard(&mut self, ui: &mut egui::Ui) {
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(BACKGROUND).inner_margin(24.0))
-            .show(context, |ui| {
+            .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.vertical(|ui| {
                         ui.label(egui::RichText::new("GAMEPAD DIAGNOSTICS").small().strong().color(GREEN));
@@ -620,11 +619,11 @@ impl GamepadApp {
 }
 
 impl eframe::App for GamepadApp {
-    fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll_events();
-        self.show_sidebar(context);
-        self.show_dashboard(context);
-        context.request_repaint_after(Duration::from_millis(8));
+        self.show_sidebar(ui);
+        self.show_dashboard(ui);
+        ui.ctx().request_repaint_after(Duration::from_millis(8));
     }
 }
 
