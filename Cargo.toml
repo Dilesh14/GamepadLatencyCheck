@@ -1,0 +1,9 @@
+[package]
+name = "gamepad-latency-tester"
+version = "0.1.0"
+edition = "2024"
+description = "A cross-platform desktop app for inspecting gamepad inputs and software-observed timing."
+
+[dependencies]
+eframe = "0.37"
+gilrs = "0.11"
