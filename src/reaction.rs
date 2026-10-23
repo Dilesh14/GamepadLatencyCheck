@@ -1,348 +1,400 @@
-use std::time::{Duration, Instant, SystemTime};
+//! Visual reaction test state machine.
+//!
+//! The measured value is app-observed reaction time: from the moment the UI
+//! submits the cue for drawing to the moment the input poller receives a button
+//! press. It includes human response and app scheduling, and is not controller
+//! hardware latency or photon-to-input latency.
 
-pub const DEFAULT_TRIAL_COUNT: usize = 20;
-pub const RESULT_PAUSE: Duration = Duration::from_millis(1_000);
+use std::time::{Duration, Instant};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+use crate::stats::{Summary, summarize};
+
+pub const TARGET_TRIALS: usize = 20;
+
+const MIN_CUE_DELAY_MS: u64 = 1_500;
+const MAX_CUE_DELAY_MS: u64 = 4_000;
+const FALSE_START_RESTART_MS: u64 = 900;
+const INTER_TRIAL_MS: u64 = 650;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CueShape {
     Circle,
     Square,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReactionPhase {
+impl CueShape {
+    fn sample() -> Self {
+        if fastrand::bool() {
+            Self::Circle
+        } else {
+            Self::Square
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Phase {
+    /// No session has been started.
     Idle,
-    Waiting {
-        cue_at: Instant,
-        shape: CueShape,
-    },
-    CueVisible {
-        shape: CueShape,
-        submitted_at: Instant,
-        submitted_wall_time: SystemTime,
-    },
-    ResultPause {
-        until: Instant,
-    },
+    /// A cue is scheduled but not visible yet.
+    Waiting,
+    /// The cue is visible and a press is expected.
+    Cue,
+    /// The user pressed before the cue; the trial will restart.
+    FalseStart,
+    /// A successful trial was recorded; the next one is scheduled shortly.
+    InterTrial,
+    /// The session is paused, typically because the controller went away.
     Paused,
+    /// All target trials have been completed.
     Complete,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+impl Phase {
+    pub fn is_active(self) -> bool {
+        matches!(
+            self,
+            Self::Waiting | Self::Cue | Self::FalseStart | Self::InterTrial
+        )
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct TrialResult {
+    pub shape: CueShape,
+    pub reaction: Duration,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PressOutcome {
-    Ignored,
+    /// A trial was completed.
+    Success,
+    /// The press came before the cue.
     FalseStart,
-    Recorded(Duration),
-    Complete(Duration),
+    /// The press was ignored because no trial was accepting input.
+    Ignored,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct ReactionSummary {
-    pub mean_ms: f64,
-    pub p95_ms: f64,
-    pub best_ms: f64,
-}
-
-#[derive(Debug)]
 pub struct ReactionSession {
-    target_trials: usize,
-    phase: ReactionPhase,
-    results: Vec<Duration>,
-    false_starts: usize,
-    last_result: Option<Duration>,
+    phase: Phase,
+    trials: Vec<TrialResult>,
+    false_starts: u32,
+    controller_name: Option<String>,
+    cue_shape: CueShape,
+    cue_shown_at: Option<Instant>,
+    /// Time of the next automatic transition (cue or next trial).
+    deadline: Option<Instant>,
+    pause_reason: Option<String>,
 }
 
 impl Default for ReactionSession {
     fn default() -> Self {
-        Self::new(DEFAULT_TRIAL_COUNT)
+        Self::new()
     }
 }
 
 impl ReactionSession {
-    pub fn new(target_trials: usize) -> Self {
+    pub fn new() -> Self {
         Self {
-            target_trials: target_trials.max(1),
-            phase: ReactionPhase::Idle,
-            results: Vec::new(),
+            phase: Phase::Idle,
+            trials: Vec::with_capacity(TARGET_TRIALS),
             false_starts: 0,
-            last_result: None,
+            controller_name: None,
+            cue_shape: CueShape::Circle,
+            cue_shown_at: None,
+            deadline: None,
+            pause_reason: None,
         }
     }
 
-    pub fn start(&mut self, now: Instant, delay: Duration, shape: CueShape) {
-        self.results.clear();
-        self.false_starts = 0;
-        self.last_result = None;
-        self.schedule_trial(now, delay, shape);
-    }
-
-    pub fn phase(&self) -> ReactionPhase {
+    pub fn phase(&self) -> Phase {
         self.phase
     }
 
-    pub fn results(&self) -> &[Duration] {
-        &self.results
+    pub fn trials(&self) -> &[TrialResult] {
+        &self.trials
     }
 
-    pub fn false_starts(&self) -> usize {
+    pub fn false_starts(&self) -> u32 {
         self.false_starts
     }
 
-    pub fn last_result(&self) -> Option<Duration> {
-        self.last_result
+    pub fn controller_name(&self) -> Option<&str> {
+        self.controller_name.as_deref()
     }
 
-    pub fn target_trials(&self) -> usize {
-        self.target_trials
+    pub fn pause_reason(&self) -> Option<&str> {
+        self.pause_reason.as_deref()
     }
 
-    pub fn advance_cue(&mut self, now: Instant, wall_time: SystemTime) {
-        if let ReactionPhase::Waiting { cue_at, shape } = self.phase {
-            if now >= cue_at {
-                self.phase = ReactionPhase::CueVisible {
-                    shape,
-                    submitted_at: now,
-                    submitted_wall_time: wall_time,
-                };
-            }
-        }
+    pub fn is_active(&self) -> bool {
+        self.phase.is_active()
     }
 
-    pub fn needs_next_trial(&self, now: Instant) -> bool {
-        matches!(self.phase, ReactionPhase::ResultPause { until } if now >= until)
+    pub fn is_paused(&self) -> bool {
+        self.phase == Phase::Paused
     }
 
-    pub fn schedule_next_trial(&mut self, now: Instant, delay: Duration, shape: CueShape) {
-        if self.needs_next_trial(now) {
-            self.schedule_trial(now, delay, shape);
-        }
+    pub fn is_complete(&self) -> bool {
+        self.phase == Phase::Complete
     }
 
-    pub fn button_pressed(
-        &mut self,
-        now: Instant,
-        event_wall_time: SystemTime,
-        restart_delay: Duration,
-        restart_shape: CueShape,
-    ) -> PressOutcome {
-        match self.phase {
-            ReactionPhase::Waiting { .. } => {
-                self.false_starts += 1;
-                self.schedule_trial(now, restart_delay, restart_shape);
-                PressOutcome::FalseStart
-            }
-            ReactionPhase::CueVisible {
-                submitted_at,
-                submitted_wall_time,
-                ..
-            } => {
-                if event_wall_time < submitted_wall_time {
-                    self.false_starts += 1;
-                    self.schedule_trial(now, restart_delay, restart_shape);
-                    return PressOutcome::FalseStart;
-                }
-
-                let elapsed = now.saturating_duration_since(submitted_at);
-                self.results.push(elapsed);
-                self.last_result = Some(elapsed);
-
-                if self.results.len() >= self.target_trials {
-                    self.phase = ReactionPhase::Complete;
-                    PressOutcome::Complete(elapsed)
-                } else {
-                    self.phase = ReactionPhase::ResultPause {
-                        until: now + RESULT_PAUSE,
-                    };
-                    PressOutcome::Recorded(elapsed)
-                }
-            }
-            ReactionPhase::Idle
-            | ReactionPhase::ResultPause { .. }
-            | ReactionPhase::Paused
-            | ReactionPhase::Complete => PressOutcome::Ignored,
-        }
+    pub fn cue_shape(&self) -> CueShape {
+        self.cue_shape
     }
 
-    pub fn pause(&mut self) {
-        if matches!(
-            self.phase,
-            ReactionPhase::Waiting { .. }
-                | ReactionPhase::CueVisible { .. }
-                | ReactionPhase::ResultPause { .. }
-        ) {
-            self.phase = ReactionPhase::Paused;
-        }
+    pub fn target(&self) -> usize {
+        TARGET_TRIALS
     }
 
-    pub fn resume(&mut self, now: Instant, delay: Duration, shape: CueShape) {
-        if matches!(self.phase, ReactionPhase::Paused) {
-            self.schedule_trial(now, delay, shape);
-        }
+    /// The number of the trial currently being attempted, capped at the target.
+    pub fn current_trial_number(&self) -> usize {
+        (self.trials.len() + 1).min(TARGET_TRIALS)
     }
 
-    pub fn reset(&mut self) {
-        self.phase = ReactionPhase::Idle;
-        self.results.clear();
-        self.false_starts = 0;
-        self.last_result = None;
-    }
-
-    pub fn summary(&self) -> Option<ReactionSummary> {
-        if self.results.is_empty() {
+    pub fn stats(&self) -> Option<Summary> {
+        if self.trials.is_empty() {
             return None;
         }
-
-        let mut samples_ms: Vec<f64> = self
-            .results
+        let values: Vec<f64> = self
+            .trials
             .iter()
-            .map(Duration::as_secs_f64)
-            .map(|seconds| seconds * 1_000.0)
+            .map(|trial| trial.reaction.as_secs_f64() * 1000.0)
             .collect();
-        samples_ms.sort_by(f64::total_cmp);
-        let p95_index = ((samples_ms.len() as f64 * 0.95).ceil() as usize)
-            .saturating_sub(1)
-            .min(samples_ms.len() - 1);
-
-        Some(ReactionSummary {
-            mean_ms: samples_ms.iter().sum::<f64>() / samples_ms.len() as f64,
-            p95_ms: samples_ms[p95_index],
-            best_ms: samples_ms[0],
-        })
+        Some(summarize(&values))
     }
 
-    fn schedule_trial(&mut self, now: Instant, delay: Duration, shape: CueShape) {
-        self.phase = ReactionPhase::Waiting {
-            cue_at: now + delay,
-            shape,
+    /// Start a new session and schedule the first cue.
+    pub fn start(&mut self, controller_name: &str, now: Instant) {
+        self.trials.clear();
+        self.false_starts = 0;
+        self.controller_name = Some(controller_name.to_owned());
+        self.pause_reason = None;
+        self.schedule_trial(now);
+    }
+
+    /// Reset the session back to its initial, not-started state.
+    pub fn reset(&mut self) {
+        *self = Self::new();
+    }
+
+    /// Advance time-based transitions. Returns true if the phase changed.
+    pub fn tick(&mut self, now: Instant) -> bool {
+        let Some(deadline) = self.deadline else {
+            return false;
         };
+        if now < deadline {
+            return false;
+        }
+
+        match self.phase {
+            Phase::Waiting => {
+                self.phase = Phase::Cue;
+                self.cue_shown_at = Some(now);
+                self.deadline = None;
+                true
+            }
+            Phase::FalseStart | Phase::InterTrial => {
+                self.schedule_trial(now);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Record a button press received at `at`.
+    pub fn press(&mut self, at: Instant) -> PressOutcome {
+        match self.phase {
+            Phase::Waiting => self.register_false_start(at),
+            Phase::Cue => {
+                let Some(shown_at) = self.cue_shown_at else {
+                    return PressOutcome::Ignored;
+                };
+                // Defensive: a queued press may carry a timestamp from before the
+                // cue was submitted (for example when the app was busy). Treat it
+                // as a false start instead of producing a bogus negative time.
+                let Some(reaction) = at.checked_duration_since(shown_at) else {
+                    return self.register_false_start(at);
+                };
+
+                self.trials.push(TrialResult {
+                    shape: self.cue_shape,
+                    reaction,
+                });
+                self.cue_shown_at = None;
+
+                if self.trials.len() >= TARGET_TRIALS {
+                    self.phase = Phase::Complete;
+                    self.deadline = None;
+                } else {
+                    self.phase = Phase::InterTrial;
+                    self.deadline = Some(at + Duration::from_millis(INTER_TRIAL_MS));
+                }
+                PressOutcome::Success
+            }
+            _ => PressOutcome::Ignored,
+        }
+    }
+
+    /// Pause an active session. Idle and completed sessions are unaffected.
+    pub fn pause(&mut self, reason: &str) {
+        if self.phase.is_active() {
+            self.phase = Phase::Paused;
+            self.deadline = None;
+            self.cue_shown_at = None;
+            self.pause_reason = Some(reason.to_owned());
+        }
+    }
+
+    /// Resume a paused session and restart the current trial with a fresh delay.
+    pub fn resume(&mut self, controller_name: &str, now: Instant) {
+        if self.phase == Phase::Paused {
+            self.controller_name = Some(controller_name.to_owned());
+            self.pause_reason = None;
+            self.schedule_trial(now);
+        }
+    }
+
+    fn schedule_trial(&mut self, now: Instant) {
+        let delay = fastrand::u64(MIN_CUE_DELAY_MS..=MAX_CUE_DELAY_MS);
+        self.phase = Phase::Waiting;
+        self.cue_shape = CueShape::sample();
+        self.cue_shown_at = None;
+        self.deadline = Some(now + Duration::from_millis(delay));
+    }
+
+    fn register_false_start(&mut self, now: Instant) -> PressOutcome {
+        self.false_starts += 1;
+        self.phase = Phase::FalseStart;
+        self.cue_shown_at = None;
+        self.deadline = Some(now + Duration::from_millis(FALSE_START_RESTART_MS));
+        PressOutcome::FalseStart
+    }
+
+    #[cfg(test)]
+    fn deadline(&self) -> Option<Instant> {
+        self.deadline
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{CueShape, PressOutcome, ReactionPhase, ReactionSession};
-    use std::time::{Duration, Instant, SystemTime};
+    use super::*;
+
+    fn completed_session() -> (ReactionSession, Instant) {
+        let mut session = ReactionSession::new();
+        let mut now = Instant::now();
+        session.start("Test pad", now);
+
+        for _ in 0..TARGET_TRIALS {
+            now += Duration::from_secs(5);
+            assert!(session.tick(now));
+            assert_eq!(session.phase(), Phase::Cue);
+            now += Duration::from_millis(250);
+            assert_eq!(session.press(now), PressOutcome::Success);
+            now += Duration::from_secs(1);
+            session.tick(now);
+        }
+
+        (session, now)
+    }
 
     #[test]
-    fn false_start_restarts_the_wait_without_counting_a_result() {
+    fn cue_delay_is_within_documented_range() {
+        let mut session = ReactionSession::new();
         let now = Instant::now();
-        let wall_time = SystemTime::UNIX_EPOCH;
-        let mut session = ReactionSession::new(2);
-        session.start(now, Duration::from_secs(1), CueShape::Circle);
+        session.start("Test pad", now);
 
-        let outcome = session.button_pressed(
-            now + Duration::from_millis(250),
-            wall_time + Duration::from_millis(250),
-            Duration::from_secs(2),
-            CueShape::Square,
-        );
+        assert_eq!(session.phase(), Phase::Waiting);
+        let delay = session.deadline().unwrap().duration_since(now);
+        assert!(delay >= Duration::from_millis(MIN_CUE_DELAY_MS));
+        assert!(delay <= Duration::from_millis(MAX_CUE_DELAY_MS));
+    }
 
-        assert_eq!(outcome, PressOutcome::FalseStart);
-        assert_eq!(session.false_starts(), 1);
-        assert!(session.results().is_empty());
+    #[test]
+    fn pressing_before_the_cue_is_a_false_start() {
+        let mut session = ReactionSession::new();
+        let now = Instant::now();
+        session.start("Test pad", now);
+
         assert_eq!(
-            session.phase(),
-            ReactionPhase::Waiting {
-                cue_at: now + Duration::from_millis(2_250),
-                shape: CueShape::Square,
-            }
+            session.press(now + Duration::from_millis(100)),
+            PressOutcome::FalseStart
         );
-    }
-
-    #[test]
-    fn cue_response_records_monotonic_elapsed_time() {
-        let now = Instant::now();
-        let wall_time = SystemTime::UNIX_EPOCH;
-        let mut session = ReactionSession::new(2);
-        session.start(now, Duration::ZERO, CueShape::Circle);
-        session.advance_cue(now, wall_time);
-
-        let outcome = session.button_pressed(
-            now + Duration::from_millis(240),
-            wall_time + Duration::from_millis(240),
-            Duration::from_secs(2),
-            CueShape::Square,
-        );
-
-        assert_eq!(outcome, PressOutcome::Recorded(Duration::from_millis(240)));
-        assert_eq!(session.results(), &[Duration::from_millis(240)]);
-        assert_eq!(session.last_result(), Some(Duration::from_millis(240)));
-    }
-
-    #[test]
-    fn stale_queued_press_does_not_count_as_a_reaction() {
-        let now = Instant::now();
-        let wall_time = SystemTime::UNIX_EPOCH;
-        let mut session = ReactionSession::new(2);
-        session.start(now, Duration::ZERO, CueShape::Circle);
-        session.advance_cue(now, wall_time + Duration::from_secs(1));
-
-        let outcome = session.button_pressed(
-            now + Duration::from_millis(50),
-            wall_time + Duration::from_millis(900),
-            Duration::from_secs(2),
-            CueShape::Square,
-        );
-
-        assert_eq!(outcome, PressOutcome::FalseStart);
+        assert_eq!(session.phase(), Phase::FalseStart);
         assert_eq!(session.false_starts(), 1);
-        assert!(session.results().is_empty());
+        assert!(session.trials().is_empty());
     }
 
     #[test]
-    fn session_completes_and_reset_clears_results() {
+    fn successful_trial_records_reaction_time() {
+        let mut session = ReactionSession::new();
         let now = Instant::now();
-        let wall_time = SystemTime::UNIX_EPOCH;
-        let mut session = ReactionSession::new(1);
-        session.start(now, Duration::ZERO, CueShape::Square);
-        session.advance_cue(now, wall_time);
-        let outcome = session.button_pressed(
-            now + Duration::from_millis(80),
-            wall_time + Duration::from_millis(80),
-            Duration::ZERO,
-            CueShape::Circle,
+        session.start("Test pad", now);
+
+        session.tick(now + Duration::from_secs(5));
+        assert_eq!(session.phase(), Phase::Cue);
+
+        assert_eq!(
+            session.press(now + Duration::from_secs(5) + Duration::from_millis(212)),
+            PressOutcome::Success
         );
+        assert_eq!(session.trials().len(), 1);
+        assert_eq!(session.trials()[0].reaction, Duration::from_millis(212));
+        assert_eq!(session.phase(), Phase::InterTrial);
+    }
 
-        assert_eq!(outcome, PressOutcome::Complete(Duration::from_millis(80)));
-        assert_eq!(session.phase(), ReactionPhase::Complete);
-        assert_eq!(session.summary().expect("one sample").best_ms, 80.0);
+    #[test]
+    fn stray_press_during_inter_trial_is_ignored() {
+        let mut session = ReactionSession::new();
+        let now = Instant::now();
+        session.start("Test pad", now);
+        session.tick(now + Duration::from_secs(5));
+        session.press(now + Duration::from_secs(5) + Duration::from_millis(200));
 
-        session.reset();
-        assert_eq!(session.phase(), ReactionPhase::Idle);
-        assert!(session.results().is_empty());
+        assert_eq!(session.phase(), Phase::InterTrial);
+        assert_eq!(
+            session.press(now + Duration::from_secs(5) + Duration::from_millis(300)),
+            PressOutcome::Ignored
+        );
         assert_eq!(session.false_starts(), 0);
-        assert!(session.summary().is_none());
+        assert_eq!(session.trials().len(), 1);
     }
 
     #[test]
-    fn pause_and_resume_void_the_active_cue_but_keep_finished_trials() {
+    fn session_completes_after_twenty_successful_trials() {
+        let (session, _) = completed_session();
+        assert_eq!(session.phase(), Phase::Complete);
+        assert_eq!(session.trials().len(), TARGET_TRIALS);
+        assert!(!session.is_active());
+    }
+
+    #[test]
+    fn pause_and_resume_restart_the_current_trial() {
+        let mut session = ReactionSession::new();
         let now = Instant::now();
-        let wall_time = SystemTime::UNIX_EPOCH;
-        let mut session = ReactionSession::new(2);
-        session.start(now, Duration::ZERO, CueShape::Circle);
-        session.advance_cue(now, wall_time);
+        session.start("Test pad", now);
+        session.tick(now + Duration::from_secs(5));
+        assert_eq!(session.phase(), Phase::Cue);
+
+        session.pause("controller disconnected");
+        assert!(session.is_paused());
+        assert_eq!(session.pause_reason(), Some("controller disconnected"));
         assert_eq!(
-            session.button_pressed(
-                now + Duration::from_millis(120),
-                wall_time + Duration::from_millis(120),
-                Duration::ZERO,
-                CueShape::Square,
-            ),
-            PressOutcome::Recorded(Duration::from_millis(120))
+            session.press(now + Duration::from_secs(6)),
+            PressOutcome::Ignored
         );
 
-        session.pause();
-        assert_eq!(session.phase(), ReactionPhase::Paused);
+        session.resume("Test pad", now + Duration::from_secs(7));
+        assert_eq!(session.phase(), Phase::Waiting);
+        assert!(session.pause_reason().is_none());
+        assert!(session.trials().is_empty());
+    }
 
-        let resumed_at = now + Duration::from_secs(30);
-        session.resume(resumed_at, Duration::from_secs(2), CueShape::Square);
-        assert_eq!(session.results(), &[Duration::from_millis(120)]);
-        assert_eq!(
-            session.phase(),
-            ReactionPhase::Waiting {
-                cue_at: resumed_at + Duration::from_secs(2),
-                shape: CueShape::Square,
-            }
-        );
+    #[test]
+    fn completed_session_is_not_paused() {
+        let (mut session, _) = completed_session();
+        session.pause("controller disconnected");
+        assert_eq!(session.phase(), Phase::Complete);
     }
 }

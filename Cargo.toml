@@ -1,11 +1,16 @@
 [package]
-name = "gamepad-latency-tester"
+name = "gamepad-latency-check"
 version = "0.1.0"
 edition = "2024"
-description = "A cross-platform desktop app for inspecting gamepad inputs and software-observed timing."
+description = "Cross-platform gamepad diagnostics and app-observed reaction time tester"
+license = "MIT"
+publish = false
 
 [dependencies]
 eframe = "0.37"
+fastrand = "2.5"
 gilrs = "0.11"
-rfd = "0.15"
-rand = "0.9"
+
+[profile.release]
+opt-level = 2
+lto = "thin"
